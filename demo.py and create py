@@ -1,0 +1,272 @@
+"""
+NeuroCipher Demo & Benchmark Script
+
+Run this to see a complete demonstration of:
+    1. NeuroCipher encryption/decryption
+    2. ML-based keystroke dynamics authentication
+    3. Multi-factor authentication flow
+    4. Performance benchmarks
+"""
+
+import sys
+import os
+import json
+import time
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from encryption.neuro_cipher import NeuroCipher
+from encryption.benchmark import EncryptionBenchmark
+from auth.authenticator import Authenticator
+from auth.ml_verifier import KeystrokeDynamicsVerifier
+
+
+def print_header(title):
+    print(f"\n{'='*70}")
+    print(f"  {title}")
+    print(f"{'='*70}\n")
+
+
+
+def demo_encryption():
+    """Demonstrate NeuroCipher encryption and decryption."""
+    print_header("1. NeuroCipher Encryption Demo")
+
+    cipher = NeuroCipher()
+
+    # Generate key pair
+    print("[*] Generating RSA-2048 key pair...")
+    private_key, public_key = cipher.generate_rsa_keypair()
+    print(f"    Public key:  {public_key[:60].decode()}...")
+    print(f"    Private key: {private_key[:60].decode()}...")
+
+    # Encrypt a message
+    message = "Hello! This is a top-secret message encrypted with NeuroCipher."
+    print(f"\n[*] Original message: '{message}'")
+    print(f"    Message length: {len(message)} chars")
+
+    print("\n[*] Encrypting with NeuroCipher (AES-256-GCM + RSA-2048 + ML S-Box)...")
+    encrypted = cipher.encrypt_message(message, public_key)
+
+    print(f"    [OK] Encrypted data: {encrypted['encrypted_data'][:32].hex()}...")
+    print(f"    [OK] Encrypted size: {len(encrypted['encrypted_data'])} bytes")
+    print(f"    [OK] Encryption time: {encrypted['encryption_time_ms']} ms")
+    print(f"    [OK] Algorithm: {encrypted['algorithm']}")
+
+    # Decrypt
+    print("\n[*] Decrypting...")
+    decrypted = cipher.decrypt_message(encrypted, private_key)
+    print(f"    [OK] Decrypted message: '{decrypted}'")
+    print(f"    [OK] Integrity check: {'PASSED' if decrypted == message else 'FAILED'}")
+
+    # Test with different messages
+    print("\n[*] Testing with multiple messages...")
+    test_messages = [
+        "Short msg",
+        "A" * 1000,
+        "Unicode test: Hello World in many ways",
+        "Special chars: !@#$%^&*()_+-=[]{}|;:<>?",
+    ]
+
+    for msg in test_messages:
+        enc = cipher.encrypt_message(msg, public_key)
+        dec = cipher.decrypt_message(enc, private_key)
+        status = "OK" if dec == msg else "FAIL"
+        print(f"    {status} '{msg[:40]}...' -> {enc['encryption_time_ms']}ms, {len(enc['encrypted_data'])}B")
+
+    print("\n    All encryption/decryption tests PASSED")
+
+
+def demo_ml_training():
+    """Demonstrate ML model training on user-specific data."""
+    print_header("2. ML Model Training Demo")
+
+    cipher = NeuroCipher()
+
+    # Train on user-specific messages
+    print("[*] Training ML model on user-specific message patterns...")
+    user_messages = [
+        "Hey, how are you doing today?",
+        "Let's meet at the coffee shop at 3pm",
+        "Can you send me that report by tomorrow?",
+        "Happy birthday! Hope you have a great day!",
+        "The meeting has been rescheduled to Friday",
+        "Just finished reading that book you recommended",
+        "What's the weather like there?",
+        "I'll call you back in 5 minutes",
+    ]
+
+    result = cipher.train_on_user_data(user_messages)
+    print(f"    [OK] Model trained: {result}")
+    print("    [OK] ML S-Box generation is now personalized to this user")
+
+
+def demo_authentication():
+    """Demonstrate the multi-factor authentication system."""
+    print_header("3. Multi-Factor Authentication Demo")
+
+    auth = Authenticator()
+
+    # Password Authentication
+    print("[*] Password Authentication (bcrypt)")
+    password = "SecureP@ss123!"
+    strength = auth.check_password_strength(password)
+    print(f"    Password: '{password}'")
+    print(f"    Strength: {strength['strength']} ({strength['percentage']}%)")
+    print(f"    Checks: {json.dumps(strength['checks'], indent=6)}")
+
+    hashed = auth.hash_password(password)
+    print(f"    Hashed: {hashed[:40]}...")
+    print(f"    Verification: {'PASSED' if auth.verify_password(password, hashed) else 'FAILED'}")
+    print(f"    Wrong password: {'REJECTED' if not auth.verify_password('wrong', hashed) else 'ACCEPTED'}")
+
+    # TOTP Demo
+    print("\n[*] TOTP Two-Factor Authentication")
+    secret = auth.generate_totp_secret()
+    print(f"    Secret key: {secret}")
+    current_token = auth.get_current_totp(secret)
+    print(f"    Current token: {current_token}")
+    print(f"    Verification: {'PASSED' if auth.verify_totp(secret, current_token) else 'FAILED'}")
+    print(f"    Wrong token: {'REJECTED' if not auth.verify_totp(secret, '000000') else 'ACCEPTED'}")
+
+    # Composite Authentication
+    print("\n[*] Composite Authentication (All Factors)")
+    result = auth.authenticate(
+        password=password,
+        password_hash=hashed,
+        totp_token=current_token,
+        totp_secret=secret,
+        keystroke_score=0.85,
+        user_id='user_1',
+        ip_address='192.168.1.1'
+    )
+
+    print(f"    Authenticated: {result['authenticated']}")
+    print(f"    Trust Score: {result['trust_score']:.0%}")
+    print(f"    Factors Passed: {result['factors_passed']}")
+    print(f"    Factors Failed: {result['factors_failed']}")
+    print(f"    Risk Level: {result['risk_assessment']['risk_level']}")
+
+
+def demo_keystroke_dynamics():
+    """Demonstrate ML-based keystroke dynamics verification."""
+    print_header("4. ML Keystroke Dynamics Verification")
+
+    verifier = KeystrokeDynamicsVerifier()
+    test_phrase = "The quick brown fox jumps"
+
+    # Enroll legitimate user samples
+    print("[*] Enrolling User A (legitimate user) - typing samples...")
+    for i in range(7):
+        events = verifier.simulate_keystroke_events(test_phrase, 'normal')
+        result = verifier.enroll_sample('user_a', events)
+        if i < 3 or i == 6:
+            print(f"    Sample {result['sample_number']}: {result['message']}")
+
+    # Enroll another user
+    print("\n[*] Enrolling User B (different typing pattern)...")
+    for i in range(7):
+        events = verifier.simulate_keystroke_events(test_phrase, 'fast')
+        verifier.enroll_sample('user_b', events)
+    print("    [OK] 7 samples enrolled for User B")
+
+    # Train the model
+    print("\n[*] Training ML classifier...")
+    train_result = verifier.train_model()
+    print(f"    [OK] Users trained: {train_result['users_trained']}")
+    print(f"    [OK] Total samples: {train_result['total_samples']}")
+    print(f"    [OK] CV Accuracy: {train_result['cv_accuracy']:.1%}")
+
+    # Top feature importances
+    print("\n    Feature Importances:")
+    importances = sorted(
+        train_result['feature_importances'].items(),
+        key=lambda x: x[1], reverse=True
+    )[:5]
+    for feat, imp in importances:
+        bar = '#' * int(imp * 100)
+        print(f"      {feat:<25} {imp:.4f} {bar}")
+
+    # Verify legitimate user
+    print("\n[*] Verifying User A with legitimate typing pattern...")
+    events = verifier.simulate_keystroke_events(test_phrase, 'normal')
+    verify = verifier.verify_user('user_a', events)
+    print(f"    Verified: {verify['verified']}")
+    print(f"    Confidence: {verify['confidence']:.1%}")
+    print(f"    Identity Match: {verify['identity_match']}")
+    print(f"    Is Anomaly: {verify['is_anomaly']}")
+
+    # Verify impostor
+    print("\n[*] Verifying User A with IMPOSTOR typing pattern...")
+    events = verifier.simulate_keystroke_events(test_phrase, 'impostor')
+    verify = verifier.verify_user('user_a', events)
+    print(f"    Verified: {verify['verified']}")
+    print(f"    Confidence: {verify['confidence']:.1%}")
+    print(f"    Predicted User: {verify['predicted_user']}")
+    print(f"    Is Anomaly: {verify['is_anomaly']}")
+
+
+def demo_benchmark():
+    """Run performance benchmarks."""
+    print_header("5. Performance Benchmark")
+
+    benchmark = EncryptionBenchmark()
+    benchmark.run_benchmark(test_sizes=[100, 1000, 10000, 50000])
+    benchmark.print_report()
+
+
+if __name__ == '__main__':
+    print("\n" + "#" * 70)
+    print("#" + " " * 68 + "#")
+    print("#" + "   NeuroCipher Secure Messenger - Full Demo".center(68) + "#")
+    print("#" + "   ML-Powered Hybrid Encryption & Authentication".center(68) + "#")
+    print("#" + " " * 68 + "#")
+    print("#" * 70)
+
+    demo_encryption()
+    demo_ml_training()
+    demo_authentication()
+    demo_keystroke_dynamics()
+    demo_benchmark()
+
+    print_header("Demo Complete!")
+    print("  To run the web application:")
+    print("    1. pip install -r requirements.txt")
+    print("    2. python app.py")
+    print("    3. Open http://localhost:5000 in your browser")
+    print()
+"""Create a test user for messaging demo."""
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from app import app, db, cipher, authenticator
+from models.database import User
+
+with app.app_context():
+    # Check if test user already exists
+    if User.query.filter_by(username='alice_demo').first():
+        print('Test user "alice_demo" already exists!')
+    else:
+        password_hash = authenticator.hash_password('DemoPass@2026')
+        private_key, public_key = cipher.generate_rsa_keypair()
+        totp_secret = authenticator.generate_totp_secret()
+
+        user = User(
+            username='alice_demo',
+            email='alice@demo.com',
+            password_hash=password_hash,
+            public_key=public_key.decode('utf-8'),
+            private_key=private_key.decode('utf-8'),
+            totp_secret=totp_secret,
+            totp_enabled=False
+        )
+        db.session.add(user)
+        db.session.commit()
+        print(f'Created test user "alice_demo" (id={user.id})')
+        print(f'Password: DemoPass@2026')
+
+    # Show all users
+    print('\nAll users:')
+    for u in User.query.all():
+        print(f'  - {u.username} (id={u.id}, email={u.email})')
