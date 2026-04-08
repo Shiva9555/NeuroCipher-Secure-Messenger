@@ -1,0 +1,579 @@
+"""
+NeuroCipher Secure Messenger - Main Flask Application
+
+A secure messaging platform featuring:
+    - NeuroCipher hybrid encryption (AES-256-GCM + RSA-2048 + ML S-Box)
+    - Multi-factor authentication (Password + TOTP + Keystroke Dynamics ML)
+    - Real-time encryption/decryption with performance metrics
+    - Security analytics dashboard
+"""
+
+import os
+import json
+import base64
+from datetime import datetime
+from flask import (Flask, render_template, request, redirect, url_for,
+                   flash, jsonify, session)
+from flask_login import (LoginManager, login_user, logout_user,
+                         login_required, current_user)
+from config import Config
+from models.database import db, User, Message, SecurityLog
+from encryption.neuro_cipher import NeuroCipher
+from encryption.benchmark import EncryptionBenchmark
+from auth.authenticator import Authenticator
+from auth.ml_verifier import KeystrokeDynamicsVerifier
+
+# ------------------------------------------------------------------ #
+#                       App Initialization                            #
+# ------------------------------------------------------------------ #
+
+app = Flask(__name__)
+app.config.from_object(Config)
+
+db.init_app(app)
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+login_manager.login_message_category = 'info'
+
+# Initialize core services
+cipher = NeuroCipher()
+authenticator = Authenticator()
+keystroke_verifier = KeystrokeDynamicsVerifier(
+    model_dir=Config.ML_MODEL_PATH
+)
+
+# Try loading existing ML models
+try:
+    keystroke_verifier.load_models()
+except Exception:
+    pass
+
+os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(Config.ML_MODEL_PATH, exist_ok=True)
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+
+# Create tables on first request
+with app.app_context():
+    db.create_all()
+
+
+# ------------------------------------------------------------------ #
+#                       Authentication Routes                         #
+# ------------------------------------------------------------------ #
+
+@app.route('/')
+def index():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    return render_template('login.html')
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        email = request.form.get('email', '').strip()
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+
+        # Validation
+        errors = []
+        if not username or len(username) < 3:
+            errors.append('Username must be at least 3 characters')
+        if not email or '@' not in email:
+            errors.append('Valid email is required')
+        if password != confirm_password:
+            errors.append('Passwords do not match')
+
+        strength = authenticator.check_password_strength(password)
+        if strength['strength'] in ('weak', 'fair'):
+            errors.append(f'Password is too weak ({strength["strength"]}). Score: {strength["percentage"]}%')
+
+        if User.query.filter_by(username=username).first():
+            errors.append('Username already exists')
+        if User.query.filter_by(email=email).first():
+            errors.append('Email already registered')
+
+        if errors:
+            return render_template('register.html', errors=errors,
+                                 username=username, email=email)
+
+        # Create user
+        password_hash = authenticator.hash_password(password)
+        private_key, public_key = cipher.generate_rsa_keypair()
+        totp_secret = authenticator.generate_totp_secret()
+
+        user = User(
+            username=username,
+            email=email,
+            password_hash=password_hash,
+            public_key=public_key.decode('utf-8'),
+            private_key=private_key.decode('utf-8'),
+            totp_secret=totp_secret,
+            totp_enabled=False
+        )
+        db.session.add(user)
+        db.session.commit()
+
+        # Log security event
+        log = SecurityLog(
+            user_id=user.id,
+            event_type='registration',
+            success=True,
+            ip_address=request.remote_addr,
+            details=json.dumps({'password_strength': strength})
+        )
+        db.session.add(log)
+        db.session.commit()
+
+        flash('Registration successful! Please log in.', 'success')
+        return redirect(url_for('login'))
+
+    return render_template('register.html')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+
+    if request.method == 'POST':
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        totp_token = request.form.get('totp_token', '').strip()
+        keystroke_data = request.form.get('keystroke_data', '')
+
+        user = User.query.filter_by(username=username).first()
+
+        if not user:
+            flash('Invalid username or password', 'error')
+            return render_template('login.html')
+
+        # Parse keystroke data
+        keystroke_score = None
+        if keystroke_data:
+            try:
+                events = json.loads(keystroke_data)
+                if events and len(events) > 2:
+                    # Enroll sample for ML training
+                    keystroke_verifier.enroll_sample(str(user.id), events)
+                    # Verify against existing profile
+                    verification = keystroke_verifier.verify_user(
+                        str(user.id), events
+                    )
+                    keystroke_score = verification['confidence']
+            except Exception:
+                keystroke_score = None
+
+        # Multi-factor authentication
+        auth_result = authenticator.authenticate(
+            password=password,
+            password_hash=user.password_hash,
+            totp_token=totp_token if user.totp_enabled else None,
+            totp_secret=user.totp_secret if user.totp_enabled else None,
+            keystroke_score=keystroke_score,
+            user_id=str(user.id),
+            ip_address=request.remote_addr
+        )
+
+        # Log security event
+        log = SecurityLog(
+            user_id=user.id,
+            event_type='login' if auth_result['authenticated'] else 'failed_login',
+            success=auth_result['authenticated'],
+            ip_address=request.remote_addr,
+            trust_score=auth_result['trust_score'],
+            factors_used=json.dumps(auth_result['factors_passed']),
+            risk_level=auth_result['risk_assessment']['risk_level'],
+            details=json.dumps({
+                'factors_failed': auth_result['factors_failed'],
+                'risk_factors': auth_result['risk_assessment']['factors']
+            })
+        )
+        db.session.add(log)
+
+        if auth_result['authenticated']:
+            user.last_login = datetime.utcnow()
+            if keystroke_score is not None:
+                user.keystroke_samples += 1
+            db.session.commit()
+
+            login_user(user)
+            session['trust_score'] = auth_result['trust_score']
+            session['auth_factors'] = auth_result['factors_passed']
+
+            # Train ML model periodically
+            if user.keystroke_samples >= 5 and user.keystroke_samples % 5 == 0:
+                try:
+                    keystroke_verifier.train_model()
+                    keystroke_verifier.save_models()
+                    user.ml_verified = True
+                    db.session.commit()
+                except Exception:
+                    pass
+
+            flash(f'Welcome back, {user.username}! Trust score: {auth_result["trust_score"]:.0%}', 'success')
+            return redirect(url_for('dashboard'))
+        else:
+            db.session.commit()
+            flash(f'Authentication failed. Trust score: {auth_result["trust_score"]:.0%}', 'error')
+            return render_template('login.html', auth_result=auth_result)
+
+    return render_template('login.html')
+
+
+@app.route('/logout')
+@login_required
+def logout():
+    log = SecurityLog(
+        user_id=current_user.id,
+        event_type='logout',
+        success=True,
+        ip_address=request.remote_addr
+    )
+    db.session.add(log)
+    db.session.commit()
+    logout_user()
+    flash('Logged out successfully', 'info')
+    return redirect(url_for('login'))
+
+
+# ------------------------------------------------------------------ #
+#                       Dashboard & Messaging                         #
+# ------------------------------------------------------------------ #
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    # Get message counts
+    inbox_count = Message.query.filter_by(
+        recipient_id=current_user.id).count()
+    unread_count = Message.query.filter_by(
+        recipient_id=current_user.id, is_read=False).count()
+    sent_count = Message.query.filter_by(
+        sender_id=current_user.id).count()
+
+    # Get recent security logs
+    recent_logs = SecurityLog.query.filter_by(
+        user_id=current_user.id
+    ).order_by(SecurityLog.timestamp.desc()).limit(5).all()
+
+    # Get all users for messaging
+    users = User.query.filter(User.id != current_user.id).all()
+
+    return render_template('dashboard.html',
+                         inbox_count=inbox_count,
+                         unread_count=unread_count,
+                         sent_count=sent_count,
+                         recent_logs=recent_logs,
+                         users=users,
+                         trust_score=session.get('trust_score', 0),
+                         auth_factors=session.get('auth_factors', []))
+
+
+@app.route('/send', methods=['GET', 'POST'])
+@login_required
+def send_message():
+    users = User.query.filter(User.id != current_user.id).all()
+
+    if request.method == 'POST':
+        recipient_id = request.form.get('recipient_id')
+        message_text = request.form.get('message', '')
+        file = request.files.get('file')
+
+        recipient = User.query.get(recipient_id)
+        if not recipient:
+            flash('Recipient not found', 'error')
+            return render_template('chat.html', users=users)
+
+        try:
+            if file and file.filename:
+                # File encryption
+                filepath = os.path.join(Config.UPLOAD_FOLDER, file.filename)
+                file.save(filepath)
+
+                encrypted = cipher.encrypt_file(
+                    filepath,
+                    recipient.public_key.encode('utf-8')
+                )
+
+                msg = Message(
+                    sender_id=current_user.id,
+                    recipient_id=recipient.id,
+                    encrypted_data=encrypted['encrypted_data'],
+                    encrypted_key=encrypted['encrypted_key'],
+                    nonce=encrypted['nonce'],
+                    tag=encrypted['tag'],
+                    is_file=True,
+                    original_filename=encrypted['original_filename'],
+                    file_size=encrypted['original_size'],
+                    encryption_time_ms=encrypted['encryption_time_ms'],
+                    algorithm=encrypted['algorithm']
+                )
+
+                # Cleanup uploaded file
+                os.remove(filepath)
+
+            else:
+                # Message encryption
+                if not message_text.strip():
+                    flash('Please enter a message or attach a file', 'error')
+                    return render_template('chat.html', users=users)
+
+                encrypted = cipher.encrypt_message(
+                    message_text,
+                    recipient.public_key.encode('utf-8')
+                )
+
+                msg = Message(
+                    sender_id=current_user.id,
+                    recipient_id=recipient.id,
+                    encrypted_data=encrypted['encrypted_data'],
+                    encrypted_key=encrypted['encrypted_key'],
+                    nonce=encrypted['nonce'],
+                    tag=encrypted['tag'],
+                    is_file=False,
+                    encryption_time_ms=encrypted['encryption_time_ms'],
+                    algorithm=encrypted['algorithm']
+                )
+
+            db.session.add(msg)
+            db.session.commit()
+
+            flash(f'Message sent securely to {recipient.username}! '
+                  f'Encryption time: {encrypted["encryption_time_ms"]:.2f}ms',
+                  'success')
+
+        except Exception as e:
+            flash(f'Encryption error: {str(e)}', 'error')
+
+        return redirect(url_for('send_message'))
+
+    return render_template('chat.html', users=users)
+
+
+@app.route('/inbox')
+@login_required
+def inbox():
+    messages = Message.query.filter_by(
+        recipient_id=current_user.id
+    ).order_by(Message.created_at.desc()).all()
+
+    decrypted_messages = []
+    for msg in messages:
+        try:
+            if msg.is_file:
+                decrypted_messages.append({
+                    'id': msg.id,
+                    'sender': msg.sender.username,
+                    'content': f'📎 File: {msg.original_filename} ({msg.file_size} bytes)',
+                    'is_file': True,
+                    'filename': msg.original_filename,
+                    'timestamp': msg.created_at,
+                    'algorithm': msg.algorithm,
+                    'encryption_time': msg.encryption_time_ms,
+                    'is_read': msg.is_read
+                })
+            else:
+                decrypted = cipher.decrypt_message(
+                    {
+                        'encrypted_data': msg.encrypted_data,
+                        'encrypted_key': msg.encrypted_key,
+                        'nonce': msg.nonce,
+                        'tag': msg.tag
+                    },
+                    current_user.private_key.encode('utf-8')
+                )
+                decrypted_messages.append({
+                    'id': msg.id,
+                    'sender': msg.sender.username,
+                    'content': decrypted,
+                    'is_file': False,
+                    'timestamp': msg.created_at,
+                    'algorithm': msg.algorithm,
+                    'encryption_time': msg.encryption_time_ms,
+                    'is_read': msg.is_read
+                })
+
+            # Mark as read
+            if not msg.is_read:
+                msg.is_read = True
+                msg.read_at = datetime.utcnow()
+        except Exception as e:
+            decrypted_messages.append({
+                'id': msg.id,
+                'sender': msg.sender.username,
+                'content': f'[Decryption error: {str(e)}]',
+                'is_file': False,
+                'timestamp': msg.created_at,
+                'algorithm': msg.algorithm,
+                'encryption_time': msg.encryption_time_ms,
+                'is_read': msg.is_read
+            })
+
+    db.session.commit()
+    return render_template('inbox.html', messages=decrypted_messages)
+
+
+# ------------------------------------------------------------------ #
+#                     Security Analytics                              #
+# ------------------------------------------------------------------ #
+
+@app.route('/analytics')
+@login_required
+def analytics():
+    # Get all security logs for the user
+    logs = SecurityLog.query.filter_by(
+        user_id=current_user.id
+    ).order_by(SecurityLog.timestamp.desc()).limit(50).all()
+
+    # Calculate statistics
+    total_logins = SecurityLog.query.filter_by(
+        user_id=current_user.id, event_type='login').count()
+    failed_logins = SecurityLog.query.filter_by(
+        user_id=current_user.id, event_type='failed_login').count()
+    total_messages_sent = Message.query.filter_by(
+        sender_id=current_user.id).count()
+    total_messages_received = Message.query.filter_by(
+        recipient_id=current_user.id).count()
+
+    # Average trust score
+    trust_scores = [l.trust_score for l in logs if l.trust_score is not None]
+    avg_trust = sum(trust_scores) / max(len(trust_scores), 1)
+
+    stats = {
+        'total_logins': total_logins,
+        'failed_logins': failed_logins,
+        'messages_sent': total_messages_sent,
+        'messages_received': total_messages_received,
+        'avg_trust_score': round(avg_trust, 2),
+        'keystroke_samples': current_user.keystroke_samples,
+        'ml_verified': current_user.ml_verified,
+        'totp_enabled': current_user.totp_enabled
+    }
+
+    return render_template('analytics.html', logs=logs, stats=stats)
+
+
+# ------------------------------------------------------------------ #
+#                         TOTP Setup                                  #
+# ------------------------------------------------------------------ #
+
+@app.route('/setup-totp', methods=['GET', 'POST'])
+@login_required
+def setup_totp():
+    if request.method == 'POST':
+        token = request.form.get('totp_token', '')
+        if authenticator.verify_totp(current_user.totp_secret, token):
+            current_user.totp_enabled = True
+            db.session.commit()
+            flash('Two-factor authentication enabled!', 'success')
+            return redirect(url_for('dashboard'))
+        else:
+            flash('Invalid verification code. Try again.', 'error')
+
+    qr_code = authenticator.generate_qr_code(
+        current_user.totp_secret,
+        current_user.username
+    )
+    current_totp = authenticator.get_current_totp(current_user.totp_secret)
+    return render_template('setup_totp.html',
+                         qr_code=qr_code,
+                         current_totp=current_totp,
+                         secret=current_user.totp_secret)
+
+
+# ------------------------------------------------------------------ #
+#                         API Endpoints                               #
+# ------------------------------------------------------------------ #
+
+@app.route('/api/benchmark', methods=['POST'])
+@login_required
+def run_benchmark():
+    """Run encryption benchmark and return results."""
+    benchmark = EncryptionBenchmark()
+    results = benchmark.run_benchmark()
+    return jsonify(results)
+
+
+@app.route('/api/encrypt-demo', methods=['POST'])
+@login_required
+def encrypt_demo():
+    """Demo endpoint to show encryption in action."""
+    data = request.get_json()
+    message = data.get('message', 'Hello, World!')
+
+    # Encrypt with the current user's public key
+    encrypted = cipher.encrypt_message(
+        message,
+        current_user.public_key.encode('utf-8')
+    )
+
+    # Show encrypted bytes as hex
+    encrypted_hex = encrypted['encrypted_data'].hex()
+
+    # Decrypt to verify
+    decrypted = cipher.decrypt_message(
+        encrypted,
+        current_user.private_key.encode('utf-8')
+    )
+
+    return jsonify({
+        'original': message,
+        'encrypted_hex': encrypted_hex[:200] + '...' if len(encrypted_hex) > 200 else encrypted_hex,
+        'encrypted_size': len(encrypted['encrypted_data']),
+        'decrypted': decrypted,
+        'integrity_verified': decrypted == message,
+        'encryption_time_ms': encrypted['encryption_time_ms'],
+        'algorithm': encrypted['algorithm']
+    })
+
+
+@app.route('/api/keystroke-enroll', methods=['POST'])
+@login_required
+def keystroke_enroll():
+    """Enroll a keystroke sample for ML training."""
+    data = request.get_json()
+    events = data.get('events', [])
+
+    if len(events) < 3:
+        return jsonify({'error': 'Need at least 3 keystrokes'}), 400
+
+    result = keystroke_verifier.enroll_sample(str(current_user.id), events)
+    current_user.keystroke_samples += 1
+    db.session.commit()
+
+    # Auto-train when enough samples
+    if result['can_train']:
+        train_result = keystroke_verifier.train_model()
+        keystroke_verifier.save_models()
+        if train_result['success']:
+            current_user.ml_verified = True
+            db.session.commit()
+            result['training'] = train_result
+
+    return jsonify(result)
+
+
+@app.route('/api/password-strength', methods=['POST'])
+def check_password():
+    """Check password strength endpoint."""
+    data = request.get_json()
+    password = data.get('password', '')
+    result = authenticator.check_password_strength(password)
+    return jsonify(result)
+
+
+# ------------------------------------------------------------------ #
+#                         Main Entry Point                            #
+# ------------------------------------------------------------------ #
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
